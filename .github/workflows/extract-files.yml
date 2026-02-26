@@ -1,0 +1,149 @@
+name: Extract Salesforce Files
+
+on:
+  workflow_dispatch:
+    inputs:
+      min_size_mb:
+        description: 'Minimum file size in MB (leave empty to extract ALL files)'
+        required: false
+        default: ''
+      target_folder:
+        description: 'Folder in repo to store files'
+        required: false
+        default: 'extracted-files'
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure git identity
+        run: |
+          git config user.name "SF File Extractor"
+          git config user.email "actions@github.com"
+
+      - name: Switch to data branch
+        run: |
+          DATA_BRANCH="extracted-data"
+          git fetch origin "$DATA_BRANCH" || true
+          if git rev-parse --verify "origin/$DATA_BRANCH" >/dev/null 2>&1; then
+            git checkout "$DATA_BRANCH"
+          else
+            git checkout --orphan "$DATA_BRANCH"
+            git rm -rf . 2>/dev/null || true
+            echo "# Extracted Salesforce Files" > README.md
+            echo "" >> README.md
+            echo "This branch contains files extracted from Salesforce by the GitHub Action." >> README.md
+            echo "Source code and documentation live on the \`main\` branch." >> README.md
+            git add README.md
+            git commit -m "Initialize extracted-data branch"
+          fi
+
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli
+
+      - name: Authenticate with Salesforce
+        run: |
+          echo "${{ secrets.SFDX_AUTH_URL }}" > auth_url.txt
+          sf org login sfdx-url --sfdx-url-file auth_url.txt --set-default --alias target-org
+          rm auth_url.txt
+
+      - name: Query and download files
+        run: |
+          MIN_SIZE_MB="${{ github.event.inputs.min_size_mb }}"
+          OUTPUT_DIR="${{ github.event.inputs.target_folder }}"
+          API_VERSION="v62.0"
+
+          mkdir -p "$OUTPUT_DIR"
+
+          ORG_INFO=$(sf org display --json)
+          ACCESS_TOKEN=$(echo "$ORG_INFO" | jq -r '.result.accessToken')
+          INSTANCE_URL=$(echo "$ORG_INFO" | jq -r '.result.instanceUrl')
+
+          # Build query — if no size specified, extract ALL files
+          if [ -z "$MIN_SIZE_MB" ]; then
+            echo "=== Querying ALL ContentVersion files ==="
+            QUERY="SELECT Id, Title, FileExtension, ContentSize, ContentDocumentId, CreatedDate, Owner.Name FROM ContentVersion WHERE IsLatest = true ORDER BY ContentSize DESC LIMIT 2000"
+            SIZE_LABEL="all sizes"
+          else
+            MIN_SIZE_BYTES=$((MIN_SIZE_MB * 1024 * 1024))
+            echo "=== Querying ContentVersion > ${MIN_SIZE_MB} MB ==="
+            QUERY="SELECT Id, Title, FileExtension, ContentSize, ContentDocumentId, CreatedDate, Owner.Name FROM ContentVersion WHERE ContentSize > ${MIN_SIZE_BYTES} AND IsLatest = true ORDER BY ContentSize DESC LIMIT 2000"
+            SIZE_LABEL="over ${MIN_SIZE_MB} MB"
+          fi
+
+          RESULT=$(sf data query --query "$QUERY" --json)
+          TOTAL=$(echo "$RESULT" | jq '.result.totalSize')
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "No files found (${SIZE_LABEL})."
+            exit 0
+          fi
+
+          echo "Found ${TOTAL} file(s). Downloading..."
+
+          # Write manifest
+          META_FILE="${OUTPUT_DIR}/_file_manifest.csv"
+          echo "ContentVersionId,ContentDocumentId,Title,Extension,SizeMB,Owner,CreatedDate,LocalFilename" > "$META_FILE"
+
+          echo "$RESULT" | jq -c '.result.records[]' | while read -r record; do
+            ID=$(echo "$record" | jq -r '.Id')
+            DOC_ID=$(echo "$record" | jq -r '.ContentDocumentId')
+            TITLE=$(echo "$record" | jq -r '.Title')
+            EXT=$(echo "$record" | jq -r '.FileExtension // "bin"')
+            SIZE=$(echo "$record" | jq -r '.ContentSize')
+            OWNER=$(echo "$record" | jq -r '.Owner.Name // "Unknown"')
+            CREATED=$(echo "$record" | jq -r '.CreatedDate')
+            SIZE_MB=$(echo "scale=2; $SIZE / 1048576" | bc)
+
+            SAFE_TITLE=$(echo "$TITLE" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g')
+            FILENAME="${SAFE_TITLE}.${EXT}"
+
+            if [ -f "${OUTPUT_DIR}/${FILENAME}" ]; then
+              FILENAME="${SAFE_TITLE}_${ID}.${EXT}"
+            fi
+
+            echo "  Downloading: ${TITLE}.${EXT} (${SIZE_MB} MB)"
+
+            HTTP_CODE=$(curl -s -w "%{http_code}" \
+              -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+              -o "${OUTPUT_DIR}/${FILENAME}" \
+              "${INSTANCE_URL}/services/data/${API_VERSION}/sobjects/ContentVersion/${ID}/VersionData")
+
+            if [ "$HTTP_CODE" -eq 200 ]; then
+              echo "${ID},${DOC_ID},\"${TITLE}\",${EXT},${SIZE_MB},\"${OWNER}\",${CREATED},${FILENAME}" >> "$META_FILE"
+            else
+              echo "  FAILED (HTTP ${HTTP_CODE})"
+              rm -f "${OUTPUT_DIR}/${FILENAME}"
+            fi
+          done
+
+          echo "=== Download complete ==="
+
+      - name: Commit and push files
+        run: |
+          OUTPUT_DIR="${{ github.event.inputs.target_folder }}"
+          MIN_SIZE_MB="${{ github.event.inputs.min_size_mb }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+          FILE_COUNT=$(find "$OUTPUT_DIR" -type f ! -name '_file_manifest.csv' | wc -l | tr -d ' ')
+
+          if [ -z "$MIN_SIZE_MB" ]; then
+            COMMIT_LABEL="all files"
+          else
+            COMMIT_LABEL="files over ${MIN_SIZE_MB} MB"
+          fi
+
+          git add "$OUTPUT_DIR/"
+
+          # Only commit if there are changes
+          if git diff --cached --quiet; then
+            echo "No new files to commit."
+          else
+            git commit -m "Extract ${FILE_COUNT} ${COMMIT_LABEL} — ${TIMESTAMP}"
+            git push origin extracted-data
+          fi
