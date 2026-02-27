@@ -16,7 +16,7 @@ if (minSizeMB > 0) {
     Integer minSizeBytes = minSizeMB * 1024 * 1024;
     files = [
         SELECT Id, Title, FileExtension, ContentSize,
-               ContentDocumentId, CreatedDate, Owner.Name
+               ContentDocumentId, Checksum, CreatedDate, Owner.Name
         FROM ContentVersion
         WHERE ContentSize > :minSizeBytes
         AND IsLatest = true
@@ -26,7 +26,7 @@ if (minSizeMB > 0) {
 } else {
     files = [
         SELECT Id, Title, FileExtension, ContentSize,
-               ContentDocumentId, CreatedDate, Owner.Name
+               ContentDocumentId, Checksum, CreatedDate, Owner.Name
         FROM ContentVersion
         WHERE IsLatest = true
         ORDER BY ContentSize DESC
@@ -51,6 +51,7 @@ for (ContentVersion cv : files) {
         sizeMB + ' MB | ' +
         cv.Title + '.' + cv.FileExtension + ' | ' +
         'DocId: ' + cv.ContentDocumentId + ' | ' +
+        'MD5: ' + cv.Checksum + ' | ' +
         'Owner: ' + cv.Owner.Name + ' | ' +
         'Created: ' + cv.CreatedDate
     );
@@ -63,11 +64,11 @@ System.debug(LoggingLevel.INFO,
 
 // --- Optional: Output as CSV for copy-paste ---
 System.debug(LoggingLevel.INFO, '\n--- CSV OUTPUT ---');
-System.debug(LoggingLevel.INFO, 'ContentVersionId,ContentDocumentId,Title,Extension,SizeMB,Owner,CreatedDate');
+System.debug(LoggingLevel.INFO, 'ContentVersionId,ContentDocumentId,Title,Extension,SizeMB,Checksum,Owner,CreatedDate');
 for (ContentVersion cv : files) {
     Decimal sizeMB = (Decimal.valueOf(cv.ContentSize) / 1048576).setScale(2);
     System.debug(LoggingLevel.INFO,
         cv.Id + ',' + cv.ContentDocumentId + ',"' + cv.Title + '",' +
-        cv.FileExtension + ',' + sizeMB + ',"' + cv.Owner.Name + '",' + cv.CreatedDate
+        cv.FileExtension + ',' + sizeMB + ',' + cv.Checksum + ',"' + cv.Owner.Name + '",' + cv.CreatedDate
     );
 }

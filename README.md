@@ -4,6 +4,8 @@ Extract ContentVersion files from any Salesforce org — locally or via GitHub A
 
 Queries the `ContentVersion` object, downloads the actual binary files via REST API, and generates a CSV manifest with full metadata. Optionally filter by file size.
 
+**Features:** Parallel downloads, resume on failure, MD5 checksum validation, size filtering, CSV manifest with full traceability.
+
 ---
 
 > **IMPORTANT: If you plan to use the GitHub Action, make your cloned/forked repo private FIRST.**
@@ -32,7 +34,9 @@ Salesforce Org
 │  1. Authenticate with sf CLI     │
 │  2. SOQL query ContentVersion    │
 │  3. REST API: download each file │
-│  4. Save locally + CSV manifest  │
+│     (parallel + resume support)  │
+│  4. MD5 checksum validation      │
+│  5. Save locally + CSV manifest  │
 └──────────────────────────────────┘
     │
     ▼
@@ -68,9 +72,10 @@ The GitHub Action runs the extraction on demand and **commits the downloaded fil
 1. You click **Run workflow** in the GitHub Actions tab
 2. The runner authenticates with Salesforce using a stored secret
 3. It switches to the `extracted-data` branch (creates it on first run)
-4. It queries ContentVersion, downloads all matching files
-5. Files + manifest CSV are committed and pushed to `extracted-data`
-6. You check out that branch to access the files
+4. It queries ContentVersion, downloads all matching files (5 parallel)
+5. Each file is verified against its Salesforce MD5 checksum
+6. Files + manifest CSV are committed and pushed to `extracted-data`
+7. You check out that branch to access the files
 
 ```
 You (GitHub UI)
@@ -79,9 +84,10 @@ You (GitHub UI)
 GitHub Actions Runner
     │  1. sf org login sfdx-url (from secret)
     │  2. git checkout extracted-data (or create it)
-    │  3. SOQL → ContentVersion
-    │  4. curl → download each file
-    │  5. git add + git commit + git push → extracted-data
+    │  3. SOQL → ContentVersion (with Checksum)
+    │  4. curl → download each file (5 parallel)
+    │  5. MD5 verify → checksum validation
+    │  6. git add + git commit + git push → extracted-data
     ▼
 Your Repo
     ├── main branch        ← source code only (what people clone)
@@ -146,6 +152,10 @@ git checkout extracted-data
 
 > These git commands work the same on all platforms (macOS, Linux, Windows).
 
+### Resume Mode
+
+Re-running the action picks up where it left off. Already-downloaded files (tracked in `_file_manifest.csv`) are skipped automatically. This is useful if a run is interrupted or if new files have been added to the org since the last extraction.
+
 ### Commit Messages
 
 The action auto-generates descriptive commit messages:
@@ -162,12 +172,14 @@ All commits go to the `extracted-data` branch. If there are no new files, it ski
 | Concern | Detail |
 |---------|--------|
 | **Data privacy** | The GitHub Action commits files to a branch in your repo. If your repo is public, those files are visible to everyone. **Make your repo private** or use the local script instead. |
+| **Query All Files permission** | By default, users can only query files they own or that are shared with them. To extract **all** files in the org, the running user needs the **"Query All Files"** permission (Setup > Permission Sets or Profiles). Without it, the extraction will silently miss files. This is especially relevant for admins/developers running the tool on behalf of the org. |
 | **Query limit** | The script queries up to 2,000 files per run (configurable `LIMIT` clause). Salesforce allows up to 50,000 rows per SOQL query. For orgs with more than 2,000 files, run multiple times with different size thresholds or increase the limit in the script/workflow. |
 | **File size (local script)** | No per-file size limit — the REST API streams binary directly to disk. |
 | **File size (GitHub Action)** | GitHub blocks files over **100 MB** per commit and warns at 50 MB. If your org has files larger than 100 MB, use the **local script** instead. |
 | **GitHub repo size** | GitHub recommends repos stay under 5 GB total. For very large extractions, consider using Git LFS or a separate storage solution. |
 | **Auth URL expiry** | SFDX Auth URLs use refresh tokens. These don't expire by default, but your Salesforce admin may enforce a Refresh Token Policy (e.g., 90-day expiry) in Session Settings. If authentication fails, regenerate the URL and update the GitHub secret. |
 | **API calls** | Each file = 1 REST API call. Daily API limits vary by Salesforce edition: Developer Edition = 15,000/day, Enterprise = 100,000+/day, Unlimited = 100,000+/day. A run of 2,000 files is well within limits for most orgs. |
+| **Checksum validation** | Downloads are verified against the `ContentVersion.Checksum` field (MD5). Mismatches are flagged in the manifest CSV. If checksums are unavailable (older orgs), validation is skipped gracefully. |
 | **Duplicate filenames** | Handled — if two files share the same name, the ContentVersionId is appended to the second filename. |
 | **Special characters** | File titles are sanitized (non-alphanumeric characters replaced with underscores). |
 
@@ -183,6 +195,8 @@ All commits go to the `extracted-data` branch. If there are no new files, it ski
 | **jq** | `brew install jq` | `apt install jq` | `choco install jq` or [download from jqlang.org](https://jqlang.github.io/jq/download/) |
 | **curl** | Pre-installed | Pre-installed | Pre-installed (Windows 10+) |
 | **Git Bash** | Not needed (use Terminal) | Not needed (use Terminal) | Included with [Git for Windows](https://git-scm.com/download/win) — **required** to run the `.sh` script |
+
+**Salesforce permission:** The running user should have the **"Query All Files"** permission to access all files in the org. Without it, only files owned by or shared with the user will be extracted.
 
 Verify installations:
 
@@ -219,9 +233,24 @@ cd sf-file-extractor
 
 # Extract files over 10 MB into a custom folder
 ./extract-files.sh 10 ./my-output
+
+# Extract files over 5 MB with 10 parallel downloads
+./extract-files.sh 5 ./my-output 10
 ```
 
 > **Windows users:** Open **Git Bash** (not Command Prompt or PowerShell) to run the script. Right-click in the folder and select "Git Bash Here", or open Git Bash and `cd` to the folder.
+
+### Resume Mode
+
+Re-run the same command to resume after an interruption. The script reads `_file_manifest.csv` and skips files that were already downloaded:
+
+```bash
+# First run — downloads 200 files, then network drops
+./extract-files.sh
+
+# Second run — picks up from file 201
+./extract-files.sh
+```
 
 ### What You'll See
 
@@ -231,6 +260,7 @@ cd sf-file-extractor
 ===========================================
  Filter    : ALL files (no size filter)
  Output    : ./extracted-files
+ Parallel  : 5 concurrent downloads
 
 [1/4] Authenticating with Salesforce...
   Connected to: my-dev-org
@@ -244,15 +274,17 @@ cd sf-file-extractor
   Contract_ABC.docx                      8.1 MB  Jane Smith
   ...
 -------------------------------------------
-[4/4] Downloading files...
-  [1/23] Product_Catalog.pdf (12.40 MB) ... OK
-  [2/23] Contract_ABC.docx (8.10 MB) ... OK
+[4/4] Downloading files (5 parallel)...
+  OK: Product_Catalog.pdf (12.40 MB) [checksum: ok]
+  OK: Contract_ABC.docx (8.10 MB) [checksum: ok]
   ...
 
 ===========================================
  Complete!
- Downloaded: ./extracted-files/
- Manifest:  ./extracted-files/_file_manifest.csv
+ Downloaded : 23
+ Verified   : 23 checksums OK
+ Manifest   : ./extracted-files/_file_manifest.csv
+ Output     : ./extracted-files/
 ===========================================
 ```
 
@@ -266,9 +298,12 @@ The `_file_manifest.csv` contains full traceability:
 | ContentDocumentId | `069xx00000xxxxx` |
 | Title | `Contract_ABC` |
 | Extension | `docx` |
+| SizeBytes | `8493465` |
 | SizeMB | `8.10` |
 | Owner | `Jane Smith` |
 | CreatedDate | `2026-01-15T09:30:00.000+0000` |
+| Checksum | `a1b2c3d4e5f6...` |
+| Verified | `ok` / `MISMATCH` / `skipped` |
 | LocalFilename | `Contract_ABC.docx` |
 
 ---
@@ -296,8 +331,8 @@ If you just want to **list** files without downloading — run `list-files.apex`
 =====================================
  ALL FILES: 47 found
 =====================================
-8.10 MB | Contract_ABC.docx | DocId: 069xx... | Owner: Jane Smith | Created: 2026-01-15
-6.30 MB | Product_Catalog.pdf    | DocId: 069xx... | Owner: John Doe   | Created: 2026-02-01
+8.10 MB | Contract_ABC.docx | DocId: 069xx... | MD5: a1b2c3... | Owner: Jane Smith | Created: 2026-01-15
+6.30 MB | Product_Catalog.pdf    | DocId: 069xx... | MD5: d4e5f6... | Owner: John Doe   | Created: 2026-02-01
 ...
 =====================================
  TOTAL: 47 files, 189.4 MB
