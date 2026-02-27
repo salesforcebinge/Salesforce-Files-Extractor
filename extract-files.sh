@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# Salesforce File Extractor
+# Salesforce Files Extractor
 # Downloads ContentVersion files from Salesforce with optional size filtering
 #
 # Usage:

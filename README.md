@@ -320,7 +320,4 @@ sf-file-extractor/
 ```
 
 ---
-
-## License
-
-MIT
+Salesforce Binge
